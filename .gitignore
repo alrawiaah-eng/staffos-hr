@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+data/
+coverage/
+*.log
+release/
+Thumbs.db
+.DS_Store
+Claude outputs/
