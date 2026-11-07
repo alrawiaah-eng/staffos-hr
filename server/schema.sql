@@ -87,3 +87,19 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS leave_substitute_idx ON leave_requests(substitute_id);
 INSERT INTO schema_migrations(version) VALUES(5) ON CONFLICT DO NOTHING;
+
+-- v6: ترحيل الرصيد أول السنة (الإغلاق التلقائي) مع نسخة كاملة غير قابلة للتعديل للسنة المغلقة
+-- used = الأيام المخصومة من استحقاق السنة، carried_used = الأيام المخصومة من المرحَّل (القيد used<=entitlement يبقى صحيحًا)
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS carried integer NOT NULL DEFAULT 0 CHECK(carried>=0);
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS carried_used integer NOT NULL DEFAULT 0;
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS carried_expires_on date;
+DO $$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='carried_used_within_carried') THEN
+  ALTER TABLE leave_balances ADD CONSTRAINT carried_used_within_carried CHECK(carried_used>=0 AND carried_used<=carried);
+ END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS leave_year_archives(year integer PRIMARY KEY, closed_at timestamptz NOT NULL DEFAULT now(), snapshot jsonb NOT NULL);
+CREATE OR REPLACE FUNCTION protect_year_archive() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'Leave year archive is immutable'; END; $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS leave_year_archive_immutable ON leave_year_archives;
+CREATE TRIGGER leave_year_archive_immutable BEFORE UPDATE OR DELETE ON leave_year_archives FOR EACH ROW EXECUTE FUNCTION protect_year_archive();
+INSERT INTO schema_migrations(version) VALUES(6) ON CONFLICT DO NOTHING;

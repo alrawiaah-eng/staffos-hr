@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import {rateLimit} from 'express-rate-limit';
 import {z} from 'zod';
 import {one} from './db.js';
+import {releaseClosedYearDays} from './yearclose.js';
 import {hashPassword,verifyPassword,token,digest,has,scope,canView,canApproveLeave,permissionLabels,encrypt,decrypt} from './security.js';
 
 const fail=(status,message)=>{throw Object.assign(Error(message),{status});};
@@ -82,7 +83,7 @@ export function createApp(db,key,{production=false}={}){
  app.get('/api/employees',async(req,res)=>{const s=scope(req.user);const rows=(await db.query(`SELECT e.*,d.name department FROM employees e JOIN departments d ON d.id=e.department_id WHERE ${s.sql} ORDER BY e.id`,s.args)).rows;res.json(rows.map(e=>{const v=safeEmployee(req.user,e);delete v.education;delete v.employment_history;delete v.personal;return v;}));});
  app.get('/api/employees/:id',async(req,res)=>{
   const e=await employee(db,req.user,req.params.id);
-  const balance=await one(db,'SELECT * FROM leave_balances WHERE employee_id=$1 AND year=$2',[e.id,new Date().getFullYear()]);
+  const balance=await one(db,'SELECT *,CASE WHEN carried_expires_on IS NOT NULL AND current_date<=carried_expires_on THEN carried-carried_used ELSE 0 END carried_left FROM leave_balances WHERE employee_id=$1 AND year=$2',[e.id,new Date().getFullYear()]);
   const changes=e.id===req.user.employee_id||has(req.user,'profile.review')?(await db.query('SELECT c.*,u.username reviewer FROM profile_changes c LEFT JOIN users u ON u.id=c.reviewer_id WHERE c.employee_id=$1 ORDER BY c.id DESC',[e.id])).rows:[];
   res.json({...safeEmployee(req.user,e),balance,changes,...await photoSummary(db,req.user,e.id)});
  });
@@ -100,8 +101,10 @@ export function createApp(db,key,{production=false}={}){
  });
  app.get('/api/employees/:id/balances',async(req,res)=>{
   const e=await employee(db,req.user,req.params.id);
-  res.json((await db.query(`SELECT b.*,COALESCE((SELECT sum(l.days) FROM leave_requests l JOIN leave_types t ON t.code=l.type WHERE l.employee_id=b.employee_id AND EXTRACT(YEAR FROM l.start_date)=b.year AND l.status IN ('MANAGER','HR','DIRECTOR') AND t.deducts=true),0)::integer reserved FROM leave_balances b WHERE b.employee_id=$1 ORDER BY b.year DESC`,[e.id])).rows);
+  res.json((await db.query(`SELECT b.*,CASE WHEN b.carried_expires_on IS NOT NULL AND current_date<=b.carried_expires_on THEN b.carried-b.carried_used ELSE 0 END carried_left,COALESCE((SELECT sum(l.days) FROM leave_requests l JOIN leave_types t ON t.code=l.type WHERE l.employee_id=b.employee_id AND EXTRACT(YEAR FROM l.start_date)=b.year AND l.status IN ('MANAGER','HR','DIRECTOR') AND t.deducts=true),0)::integer reserved FROM leave_balances b WHERE b.employee_id=$1 ORDER BY b.year DESC`,[e.id])).rows);
  });
+ app.get('/api/leave-archives',async(req,res)=>{required(req.user,'leave.balance');res.json((await db.query('SELECT year,closed_at,jsonb_array_length(snapshot->\'balances\')::integer employees,jsonb_array_length(snapshot->\'leaves\')::integer leaves FROM leave_year_archives ORDER BY year DESC')).rows);});
+ app.get('/api/leave-archives/:year',async(req,res)=>{required(req.user,'leave.balance');const year=z.coerce.number().int().min(1900).max(2100).parse(req.params.year);const a=await one(db,'SELECT year,closed_at,snapshot FROM leave_year_archives WHERE year=$1',[year]);if(!a)fail(404,'لا توجد نسخة مغلقة لهذه السنة');res.json(a);});
  app.put('/api/employees/:id/balances/:year',async(req,res)=>{
   required(req.user,'leave.balance');const b=z.object({entitlement:z.number().int().min(0).max(366),reason:str(1000)}).strict().parse(req.body);
   const year=z.coerce.number().int().min(1900).max(2100).parse(req.params.year);
@@ -197,7 +200,7 @@ export function createApp(db,key,{production=false}={}){
     substituteId=sub.id;
    }
    const year=Number(b.start_date.slice(0,4));await tx.query('INSERT INTO leave_balances(employee_id,year) VALUES($1,$2) ON CONFLICT DO NOTHING',[e.id,year]);
-   if(t.deducts){const bal=await one(tx,'SELECT * FROM leave_balances WHERE employee_id=$1 AND year=$2',[e.id,year]);const pending=await one(tx,"SELECT COALESCE(sum(l.days),0)::integer total FROM leave_requests l JOIN leave_types t ON t.code=l.type WHERE employee_id=$1 AND EXTRACT(YEAR FROM start_date)=$2 AND status IN ('MANAGER','HR','DIRECTOR') AND t.deducts=true",[e.id,year]);if(bal.entitlement-bal.used-pending.total<days)fail(400,'رصيد الإجازة المتاح لا يكفي بعد احتساب الطلبات المعلّقة');}
+   if(t.deducts){const bal=await one(tx,'SELECT *,(carried_expires_on IS NOT NULL AND $3::date<=carried_expires_on) carry_ok FROM leave_balances WHERE employee_id=$1 AND year=$2',[e.id,year,b.start_date]);const pending=await one(tx,"SELECT COALESCE(sum(l.days),0)::integer total FROM leave_requests l JOIN leave_types t ON t.code=l.type WHERE employee_id=$1 AND EXTRACT(YEAR FROM start_date)=$2 AND status IN ('MANAGER','HR','DIRECTOR') AND t.deducts=true",[e.id,year]);if(bal.entitlement-bal.used+(bal.carry_ok?bal.carried-bal.carried_used:0)-pending.total<days)fail(400,'رصيد الإجازة المتاح لا يكفي بعد احتساب الطلبات المعلّقة');}
    const d=await one(tx,'SELECT * FROM departments WHERE id=$1',[e.department_id]);
    const manager=d.manager_id&&d.manager_id!==e.id?await one(tx,"SELECT u.id FROM users u JOIN roles r ON r.code=u.role WHERE u.employee_id=$1 AND u.active=true AND r.permissions ? 'leave.manager'",[d.manager_id]):null;
    const stage=manager?'MANAGER':'HR';
@@ -213,12 +216,13 @@ export function createApp(db,key,{production=false}={}){
    const status=b.decision==='REJECT'?'REJECTED':l.status==='MANAGER'?'HR':l.status==='HR'&&l.director_required?'DIRECTOR':'APPROVED';
    if(status==='APPROVED'){
     await tx.query('SELECT id FROM employees WHERE id=$1 FOR UPDATE',[l.employee_id]);const t=await one(tx,'SELECT * FROM leave_types WHERE code=$1',[l.type]);
-    if(t.deducts){const year=new Date(l.start_date).getUTCFullYear();const bal=await one(tx,'UPDATE leave_balances SET used=used+$3 WHERE employee_id=$1 AND year=$2 AND entitlement-used>=$3 RETURNING employee_id',[l.employee_id,year,l.days]);if(!bal)fail(409,'رصيد الموظف غير كافٍ للاعتماد');}
+    if(t.deducts){const year=new Date(l.start_date).getUTCFullYear();const cur=await one(tx,'SELECT b.*,(b.carried_expires_on IS NOT NULL AND r.start_date<=b.carried_expires_on) carry_ok FROM leave_balances b JOIN leave_requests r ON r.id=$3 WHERE b.employee_id=$1 AND b.year=$2 FOR UPDATE OF b',[l.employee_id,year,l.id]);const fromCarry=cur&&cur.carry_ok?Math.min(l.days,cur.carried-cur.carried_used):0;const bal=cur&&await one(tx,'UPDATE leave_balances SET carried_used=carried_used+$3,used=used+$4 WHERE employee_id=$1 AND year=$2 AND entitlement-used>=$4 RETURNING employee_id',[l.employee_id,year,fromCarry,l.days-fromCarry]);if(!bal)fail(409,'رصيد الموظف غير كافٍ للاعتماد');}
    }
+   if(status==='REJECTED')await releaseClosedYearDays(tx,l);
    await tx.query('UPDATE leave_requests SET status=$2 WHERE id=$1',[l.id,status]);await tx.query('INSERT INTO leave_approvals(leave_id,actor_id,stage,decision,comment) VALUES($1,$2,$3,$4,$5)',[l.id,req.user.id,l.status,b.decision,b.comment]);await audit(tx,req.user,b.decision,'leave',l.id,{status:l.status},{status,comment:b.comment});await notify(tx,l.employee_id,'تحديث طلب الإجازة',`الطلب #${l.id}: ${status==='APPROVED'?'موافق عليه':status==='REJECTED'?'مرفوض — '+b.comment:'انتقل إلى المرحلة التالية'}`);await routeNotice(tx,{...l,status});
   });res.json({ok:true});
  });
- app.post('/api/leave/:id/cancel',async(req,res)=>{await db.transaction(async tx=>{const l=await one(tx,'SELECT * FROM leave_requests WHERE id=$1 FOR UPDATE',[req.params.id]);if(!l)fail(404,'الطلب غير موجود');if(l.employee_id!==req.user.employee_id)fail(403,'يمكنك إلغاء طلباتك فقط');if(!['MANAGER','HR','DIRECTOR'].includes(l.status))fail(409,'يمكن إلغاء الطلب قبل الاعتماد النهائي فقط');await tx.query("UPDATE leave_requests SET status='CANCELLED' WHERE id=$1",[l.id]);await audit(tx,req.user,'CANCEL','leave',l.id,{status:l.status},{status:'CANCELLED'});});res.json({ok:true});});
+ app.post('/api/leave/:id/cancel',async(req,res)=>{await db.transaction(async tx=>{const l=await one(tx,'SELECT * FROM leave_requests WHERE id=$1 FOR UPDATE',[req.params.id]);if(!l)fail(404,'الطلب غير موجود');if(l.employee_id!==req.user.employee_id)fail(403,'يمكنك إلغاء طلباتك فقط');if(!['MANAGER','HR','DIRECTOR'].includes(l.status))fail(409,'يمكن إلغاء الطلب قبل الاعتماد النهائي فقط');await releaseClosedYearDays(tx,l);await tx.query("UPDATE leave_requests SET status='CANCELLED' WHERE id=$1",[l.id]);await audit(tx,req.user,'CANCEL','leave',l.id,{status:l.status},{status:'CANCELLED'});});res.json({ok:true});});
  app.get('/api/approvals',async(req,res)=>{
   const leaves=(await db.query("SELECT l.*,e.name employee,d.manager_id,t.label type_label,sub.name substitute_name FROM leave_requests l JOIN employees e ON e.id=l.employee_id JOIN departments d ON d.id=e.department_id JOIN leave_types t ON t.code=l.type LEFT JOIN employees sub ON sub.id=l.substitute_id WHERE l.status IN ('MANAGER','HR','DIRECTOR') ORDER BY l.id",[])).rows.filter(l=>canApproveLeave(req.user,l));
   const changes=has(req.user,'profile.review')?(await db.query("SELECT c.*,e.name employee FROM profile_changes c JOIN employees e ON e.id=c.employee_id WHERE c.status='PENDING' AND c.employee_id<>$1 ORDER BY c.id",[req.user.employee_id])).rows:[];
@@ -256,7 +260,7 @@ export function createApp(db,key,{production=false}={}){
  });
  app.get('/api/reports',async(req,res)=>{
   required(req.user,'reports.view');const s=scope(req.user);
-  const people=(await db.query(`SELECT e.id,e.employee_no,e.name,e.department_id,d.name department,e.status,b.year,COALESCE(b.entitlement,30) entitlement,COALESCE(b.used,0) used FROM employees e JOIN departments d ON d.id=e.department_id LEFT JOIN leave_balances b ON b.employee_id=e.id AND b.year=EXTRACT(YEAR FROM current_date) WHERE ${s.sql} ORDER BY e.id`,s.args)).rows;
+  const people=(await db.query(`SELECT e.id,e.employee_no,e.name,e.department_id,d.name department,e.status,b.year,COALESCE(b.entitlement,30)+COALESCE(CASE WHEN b.carried_expires_on IS NOT NULL AND current_date<=b.carried_expires_on THEN b.carried ELSE b.carried_used END,0) entitlement,COALESCE(b.used,0)+COALESCE(b.carried_used,0) used FROM employees e JOIN departments d ON d.id=e.department_id LEFT JOIN leave_balances b ON b.employee_id=e.id AND b.year=EXTRACT(YEAR FROM current_date) WHERE ${s.sql} ORDER BY e.id`,s.args)).rows;
   const leaves=(await db.query(`SELECT l.*,e.name employee,t.label type_label FROM leave_requests l JOIN employees e ON e.id=l.employee_id JOIN leave_types t ON t.code=l.type WHERE ${s.sql} ORDER BY l.start_date DESC`,s.args)).rows;
   const docs=has(req.user,'documents.view')?(await db.query(`SELECT d.id,d.employee_id,e.name employee,d.kind,d.expires_on,d.status FROM documents d JOIN employees e ON e.id=d.employee_id WHERE ${s.sql}`,s.args)).rows:[];
   const records=(await db.query(`SELECT r.id,r.employee_id,r.kind,r.title,r.issuer,r.date,e.name employee FROM records r JOIN employees e ON e.id=r.employee_id WHERE ${s.sql} ORDER BY r.date DESC`,s.args)).rows;
