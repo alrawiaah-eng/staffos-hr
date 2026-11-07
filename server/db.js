@@ -4,7 +4,8 @@ import pg from 'pg';
 import {readFile,mkdir,readdir,lstat,chmod} from 'node:fs/promises';
 import path from 'node:path';
 const safeWindowsDirectory=path.join(process.env.APPDATA||process.env.LOCALAPPDATA||process.cwd(),'StaffOS','data','postgres-v2');
-export async function connectDatabase({url=process.env.DATABASE_URL, directory=process.env.PGLITE_DIR || (process.platform==='win32'?safeWindowsDirectory:'./data/postgres')}={}) {
+const configuredRoot=process.env.STAFFOS_DATA_DIR?path.join(process.env.STAFFOS_DATA_DIR,'postgres'):null;
+export async function connectDatabase({url=process.env.DATABASE_URL, directory=process.env.PGLITE_DIR || configuredRoot || (process.platform==='win32'?safeWindowsDirectory:'./data/postgres')}={}) {
  if(url){
   const pool=new pg.Pool({connectionString:url, max:10});
   return {query:(sql,args)=>pool.query(sql,args), exec:sql=>pool.query(sql), close:()=>pool.end(), transaction:async fn=>{
