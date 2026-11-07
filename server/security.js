@@ -1,5 +1,6 @@
 import {scryptSync,randomBytes,timingSafeEqual,createHash,createCipheriv,createDecipheriv} from 'node:crypto';
 import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import path from 'node:path';
 export const permissionLabels={
  'employees.all':'عرض جميع الموظفين','employees.team':'عرض موظفي القسم','employees.edit':'إدارة السجل الوظيفي','salary.view':'عرض الراتب','salary.edit':'تعديل الراتب',
  'documents.view':'عرض المستمسكات','documents.review':'تدقيق المستمسكات','records.edit':'إدارة الدورات والتكريم','profile.review':'اعتماد البيانات الشخصية',
@@ -21,7 +22,9 @@ export const digest=value=>createHash('sha256').update(value).digest('hex');
 export async function encryptionKey(){
  if(process.env.DOCUMENT_KEY){const key=Buffer.from(process.env.DOCUMENT_KEY,'hex');if(key.length!==32)throw Error('DOCUMENT_KEY must contain 64 hexadecimal characters');return key;}
  if(process.env.NODE_ENV==='production')throw Error('DOCUMENT_KEY is required in production');
- await mkdir('./data',{recursive:true});try{return await readFile('./data/document.key');}catch(e){if(e.code!=='ENOENT')throw e;const key=randomBytes(32);await writeFile('./data/document.key',key,{mode:0o600,flag:'wx'});return key;}
+ const directory=process.env.STAFFOS_DATA_DIR||'./data';
+ const keyPath=path.join(directory,'document.key');
+ await mkdir(directory,{recursive:true});try{return await readFile(keyPath);}catch(e){if(e.code!=='ENOENT')throw e;const key=randomBytes(32);await writeFile(keyPath,key,{mode:0o600,flag:'wx'});return key;}
 }
 export function encrypt(data,key){const iv=randomBytes(12);const cipher=createCipheriv('aes-256-gcm',key,iv);const bytes=Buffer.concat([cipher.update(data),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),bytes]);}
 export function decrypt(data,key){const b=Buffer.from(data);const c=createDecipheriv('aes-256-gcm',key,b.subarray(0,12));c.setAuthTag(b.subarray(12,28));return Buffer.concat([c.update(b.subarray(28)),c.final()]);}

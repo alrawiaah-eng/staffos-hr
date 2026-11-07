@@ -17,5 +17,5 @@ if(existsSync(path.join(distRoot,'index.html'))&&!process.argv.includes('--dev')
 else if(!production){const {createServer}=await import('vite');const vite=await createServer({root:appRoot,server:{middlewareMode:true},appType:'spa'});app.use(vite.middlewares);}
 else throw Error('Run npm run build before production start');
 await expiryScan(db);const timer=setInterval(()=>expiryScan(db).catch(console.error),60*60*1000);timer.unref();
-const server=app.listen(Number(process.env.PORT)||3000,process.env.HOST||'127.0.0.1',()=>console.log('HR & Leave running at '+(process.env.APP_ORIGIN||'http://localhost:3000')));
+export const server=app.listen(Number(process.env.PORT)||3000,process.env.HOST||'127.0.0.1',()=>console.log('HR & Leave running at '+(process.env.APP_ORIGIN||'http://localhost:3000')));
 async function stop(){clearInterval(timer);server.close();await db.close();process.exit(0);}process.on('SIGTERM',stop);process.on('SIGINT',stop);

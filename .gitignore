@@ -8,3 +8,4 @@ release/
 Thumbs.db
 .DS_Store
 Claude outputs/
+dist.bak/
