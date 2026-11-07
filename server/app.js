@@ -159,22 +159,50 @@ export function createApp(db,key,{production=false}={}){
   });res.json({ok:true});
  });
  app.get('/api/leave',async(req,res)=>{
-  const s=scope(req.user);res.json((await db.query(`SELECT l.*,e.name employee,d.name department,d.manager_id,t.label type_label FROM leave_requests l JOIN employees e ON e.id=l.employee_id JOIN departments d ON d.id=e.department_id JOIN leave_types t ON t.code=l.type WHERE ${s.sql} ORDER BY l.id DESC`,s.args)).rows);
+  const s=scope(req.user);res.json((await db.query(`SELECT l.*,e.name employee,d.name department,d.manager_id,t.label type_label,sub.name substitute_name FROM leave_requests l JOIN employees e ON e.id=l.employee_id JOIN departments d ON d.id=e.department_id JOIN leave_types t ON t.code=l.type LEFT JOIN employees sub ON sub.id=l.substitute_id WHERE ${s.sql} ORDER BY l.id DESC`,s.args)).rows);
+ });
+ app.get('/api/leave/substitutes',async(req,res)=>{
+  const q=z.object({start_date:date,end_date:date}).parse(req.query);
+  if(q.end_date<q.start_date)fail(400,'نطاق التاريخ غير صحيح');
+  const me=await one(db,'SELECT id,department_id FROM employees WHERE id=$1',[req.user.employee_id]);
+  const colleagues=await one(db,"SELECT count(*)::integer n FROM employees WHERE department_id=$1 AND id<>$2 AND status='ACTIVE'",[me.department_id,me.id]);
+  const candidates=(await db.query(`SELECT e.id,e.name,e.job_title FROM employees e
+   WHERE e.department_id=$1 AND e.id<>$2 AND e.status='ACTIVE'
+   AND NOT EXISTS(SELECT 1 FROM leave_requests l WHERE l.employee_id=e.id AND l.status NOT IN ('REJECTED','CANCELLED') AND l.start_date<=$4 AND l.end_date>=$3)
+   AND NOT EXISTS(SELECT 1 FROM leave_requests l WHERE l.substitute_id=e.id AND l.status NOT IN ('REJECTED','CANCELLED') AND l.start_date<=$4 AND l.end_date>=$3)
+   ORDER BY e.name`,[me.department_id,me.id,q.start_date,q.end_date])).rows;
+  res.json({candidates,colleagues:colleagues.n});
  });
  app.get('/api/leave/:id/history',async(req,res)=>{const l=await one(db,'SELECT * FROM leave_requests WHERE id=$1',[req.params.id]);if(!l)fail(404,'الطلب غير موجود');await employee(db,req.user,l.employee_id);res.json((await db.query('SELECT a.*,u.username actor FROM leave_approvals a JOIN users u ON u.id=a.actor_id WHERE leave_id=$1 ORDER BY a.id',[l.id])).rows);});
  app.post('/api/leave',async(req,res)=>{
-  const b=z.object({type:str(30),start_date:date,end_date:date,reason:str(1000)}).parse(req.body);
+  const b=z.object({type:str(30),start_date:date,end_date:date,reason:str(1000),substitute_id:z.coerce.number().int().positive().nullable().optional(),substitute_note:z.string().trim().max(300).optional().default('')}).parse(req.body);
   const days=Math.round((Date.parse(b.end_date)-Date.parse(b.start_date))/86400000)+1;
   if(days<1||days>366)fail(400,'نطاق الإجازة غير صحيح');if(b.start_date<new Date().toISOString().slice(0,10))fail(400,'لا يمكن تقديم إجازة بتاريخ سابق');if(b.start_date.slice(0,4)!==b.end_date.slice(0,4))fail(400,'قدّم طلبًا منفصلًا لكل سنة');
   const result=await db.transaction(async tx=>{
    const e=await one(tx,'SELECT * FROM employees WHERE id=$1 FOR UPDATE',[req.user.employee_id]);if(e.status!=='ACTIVE')fail(403,'الحساب الوظيفي غير نشط');const t=await one(tx,'SELECT * FROM leave_types WHERE code=$1',[b.type]);if(!t)fail(400,'نوع الإجازة غير صحيح');
    const overlap=await one(tx,"SELECT id FROM leave_requests WHERE employee_id=$1 AND status NOT IN ('REJECTED','CANCELLED') AND start_date<=$3 AND end_date>=$2",[e.id,b.start_date,b.end_date]);if(overlap)fail(409,'تتداخل التواريخ مع طلب إجازة قائم');
+   const covering=await one(tx,"SELECT l.id,c.name FROM leave_requests l JOIN employees c ON c.id=l.employee_id WHERE l.substitute_id=$1 AND l.status NOT IN ('REJECTED','CANCELLED') AND l.start_date<=$3 AND l.end_date>=$2",[e.id,b.start_date,b.end_date]);
+   if(covering)fail(409,`أنت مكلّف بالتغطية عن ${covering.name} في فترة متداخلة (الطلب #${covering.id}). عدّل بديل ذلك الطلب أولًا`);
+   let substituteId=null;
+   if(b.substitute_id){
+    const sub=await one(tx,'SELECT id,name,department_id,status FROM employees WHERE id=$1',[b.substitute_id]);
+    if(!sub)fail(400,'البديل المختار غير موجود');
+    if(sub.id===e.id)fail(400,'لا يمكن أن يكون الموظف بديلًا لنفسه');
+    if(sub.status!=='ACTIVE')fail(400,`${sub.name} غير نشط على الملاك`);
+    if(sub.department_id!==e.department_id)fail(400,'يجب أن يكون البديل من قسم الموظف نفسه');
+    const away=await one(tx,"SELECT start_date,end_date FROM leave_requests WHERE employee_id=$1 AND status NOT IN ('REJECTED','CANCELLED') AND start_date<=$3 AND end_date>=$2",[sub.id,b.start_date,b.end_date]);
+    if(away)fail(409,`${sub.name} مجاز خلال الفترة نفسها. اختر بديلًا آخر`);
+    const busy=await one(tx,"SELECT c.name FROM leave_requests l JOIN employees c ON c.id=l.employee_id WHERE l.substitute_id=$1 AND l.status NOT IN ('REJECTED','CANCELLED') AND l.start_date<=$3 AND l.end_date>=$2",[sub.id,b.start_date,b.end_date]);
+    if(busy)fail(409,`${sub.name} مكلّف أصلًا بالتغطية عن ${busy.name} في فترة متداخلة`);
+    substituteId=sub.id;
+   }
    const year=Number(b.start_date.slice(0,4));await tx.query('INSERT INTO leave_balances(employee_id,year) VALUES($1,$2) ON CONFLICT DO NOTHING',[e.id,year]);
    if(t.deducts){const bal=await one(tx,'SELECT * FROM leave_balances WHERE employee_id=$1 AND year=$2',[e.id,year]);const pending=await one(tx,"SELECT COALESCE(sum(l.days),0)::integer total FROM leave_requests l JOIN leave_types t ON t.code=l.type WHERE employee_id=$1 AND EXTRACT(YEAR FROM start_date)=$2 AND status IN ('MANAGER','HR','DIRECTOR') AND t.deducts=true",[e.id,year]);if(bal.entitlement-bal.used-pending.total<days)fail(400,'رصيد الإجازة المتاح لا يكفي بعد احتساب الطلبات المعلّقة');}
    const d=await one(tx,'SELECT * FROM departments WHERE id=$1',[e.department_id]);
    const manager=d.manager_id&&d.manager_id!==e.id?await one(tx,"SELECT u.id FROM users u JOIN roles r ON r.code=u.role WHERE u.employee_id=$1 AND u.active=true AND r.permissions ? 'leave.manager'",[d.manager_id]):null;
    const stage=manager?'MANAGER':'HR';
-   const l=await one(tx,'INSERT INTO leave_requests(employee_id,type,start_date,end_date,days,reason,status,director_required) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',[e.id,b.type,b.start_date,b.end_date,days,b.reason,stage,t.director_required||days>7]);
+   const l=await one(tx,'INSERT INTO leave_requests(employee_id,type,start_date,end_date,days,reason,status,director_required,substitute_id,substitute_note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',[e.id,b.type,b.start_date,b.end_date,days,b.reason,stage,t.director_required||days>7,substituteId,b.substitute_note]);
+   if(substituteId)await notify(tx,substituteId,'تكليف بديل أثناء إجازة',`${e.name}: ${b.start_date} — ${b.end_date}`,'/leave');
    await audit(tx,req.user,'SUBMIT','leave',l.id,null,l);await routeNotice(tx,l);return l;
   });res.status(201).json(result);
  });
@@ -192,7 +220,7 @@ export function createApp(db,key,{production=false}={}){
  });
  app.post('/api/leave/:id/cancel',async(req,res)=>{await db.transaction(async tx=>{const l=await one(tx,'SELECT * FROM leave_requests WHERE id=$1 FOR UPDATE',[req.params.id]);if(!l)fail(404,'الطلب غير موجود');if(l.employee_id!==req.user.employee_id)fail(403,'يمكنك إلغاء طلباتك فقط');if(!['MANAGER','HR','DIRECTOR'].includes(l.status))fail(409,'يمكن إلغاء الطلب قبل الاعتماد النهائي فقط');await tx.query("UPDATE leave_requests SET status='CANCELLED' WHERE id=$1",[l.id]);await audit(tx,req.user,'CANCEL','leave',l.id,{status:l.status},{status:'CANCELLED'});});res.json({ok:true});});
  app.get('/api/approvals',async(req,res)=>{
-  const leaves=(await db.query("SELECT l.*,e.name employee,d.manager_id,t.label type_label FROM leave_requests l JOIN employees e ON e.id=l.employee_id JOIN departments d ON d.id=e.department_id JOIN leave_types t ON t.code=l.type WHERE l.status IN ('MANAGER','HR','DIRECTOR') ORDER BY l.id",[])).rows.filter(l=>canApproveLeave(req.user,l));
+  const leaves=(await db.query("SELECT l.*,e.name employee,d.manager_id,t.label type_label,sub.name substitute_name FROM leave_requests l JOIN employees e ON e.id=l.employee_id JOIN departments d ON d.id=e.department_id JOIN leave_types t ON t.code=l.type LEFT JOIN employees sub ON sub.id=l.substitute_id WHERE l.status IN ('MANAGER','HR','DIRECTOR') ORDER BY l.id",[])).rows.filter(l=>canApproveLeave(req.user,l));
   const changes=has(req.user,'profile.review')?(await db.query("SELECT c.*,e.name employee FROM profile_changes c JOIN employees e ON e.id=c.employee_id WHERE c.status='PENDING' AND c.employee_id<>$1 ORDER BY c.id",[req.user.employee_id])).rows:[];
   const documents=has(req.user,'documents.review')?(await db.query("SELECT d.id,d.employee_id,e.name employee,d.kind,d.number,d.expires_on,(d.back_data IS NOT NULL) has_back FROM documents d JOIN employees e ON e.id=d.employee_id WHERE d.status='PENDING' AND d.employee_id<>$1 ORDER BY d.id",[req.user.employee_id])).rows:[];
   res.json({leaves,changes,documents,photos:await photoQueue(db,req.user)});

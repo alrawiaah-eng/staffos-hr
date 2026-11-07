@@ -76,3 +76,14 @@ DO $$ BEGIN
   INSERT INTO schema_migrations(version) VALUES(4);
  END IF;
 END $$;
+
+-- v5: البديل في العمل أثناء الإجازة (Replacement if Applicable)
+ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS substitute_id integer REFERENCES employees(id);
+ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS substitute_note text NOT NULL DEFAULT '';
+DO $$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leave_substitute_not_self') THEN
+  ALTER TABLE leave_requests ADD CONSTRAINT leave_substitute_not_self CHECK(substitute_id IS NULL OR substitute_id<>employee_id);
+ END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS leave_substitute_idx ON leave_requests(substitute_id);
+INSERT INTO schema_migrations(version) VALUES(5) ON CONFLICT DO NOTHING;

@@ -32,6 +32,42 @@ test('department routing rejects ineligible reviewers and reroutes pending reque
  assert.equal((await one(db,'SELECT status FROM leave_requests WHERE id=$1',[l.body.id])).status,'HR');
  await request(clients.admin,'/departments/'+department,'PUT',{name:'العمليات',manager_id:clients.manager.me.employee_id});
 });
+test('البديل: من نفس القسم، ويُرفض إن كان مجازًا أو مكلّفًا بتغطية أخرى',async()=>{
+ const window=dates(200,3);
+ const list=(await request(clients.employee,`/leave/substitutes?start_date=${window.start_date}&end_date=${window.end_date}`)).body;
+ assert.ok(list.colleagues>0,'قسم الموظف يجب أن يضم زميلًا واحدًا على الأقل');
+ assert.ok(list.candidates.some(c=>c.id===clients.manager.me.employee_id),'المسؤول زميل متاح في القسم نفسه');
+ assert.ok(list.candidates.every(c=>c.id!==clients.employee.me.employee_id),'لا يظهر الموظف لنفسه');
+
+ const outsider=await one(db,"SELECT id FROM employees WHERE department_id<>$1 AND status='ACTIVE' LIMIT 1",[clients.employee.me.department_id]);
+ const cross=await request(clients.employee,'/leave','POST',{type:'ANNUAL',...window,reason:'بديل من قسم آخر',substitute_id:outsider.id});
+ assert.equal(cross.status,400);
+ assert.match(cross.body.error,/قسم الموظف نفسه/);
+
+ const itself=await request(clients.employee,'/leave','POST',{type:'ANNUAL',...window,reason:'بديل نفسه',substitute_id:clients.employee.me.employee_id});
+ assert.equal(itself.status,400);
+
+ const ok=await request(clients.employee,'/leave','POST',{type:'ANNUAL',...window,reason:'طلب ببديل صحيح',substitute_id:clients.manager.me.employee_id,substitute_note:'تسليم المهام'});
+ assert.equal(ok.status,201,JSON.stringify(ok.body));
+ const row=(await request(clients.employee,'/leave')).body.find(l=>l.id===ok.body.id);
+ assert.equal(row.substitute_name,clients.manager.me.name);
+
+ const after=(await request(clients.employee,`/leave/substitutes?start_date=${window.start_date}&end_date=${window.end_date}`)).body;
+ assert.ok(after.candidates.every(c=>c.id!==clients.manager.me.employee_id),'المكلّف بتغطية لا يُعرض كبديل متاح في الفترة نفسها');
+
+ const inside=dates(201,1);
+ const blocked=await request(clients.manager,'/leave','POST',{type:'ANNUAL',...inside,reason:'إجازة أثناء فترة التغطية'});
+ assert.equal(blocked.status,409);
+ assert.match(blocked.body.error,/مكلّف بالتغطية/);
+
+ const outside=dates(230,1);
+ const allowed=await request(clients.manager,'/leave','POST',{type:'ANNUAL',...outside,reason:'إجازة خارج فترة التغطية'});
+ assert.equal(allowed.status,201,JSON.stringify(allowed.body));
+
+ const busy=await request(clients.employee,'/leave','POST',{type:'ANNUAL',...dates(230,1),reason:'بديل مجاز',substitute_id:clients.manager.me.employee_id});
+ assert.equal(busy.status,409);
+ assert.match(busy.body.error,/مجاز خلال الفترة نفسها/);
+});
 test('audit records cannot be modified or deleted through SQL',async()=>{
  await assert.rejects(db.query("UPDATE audit_logs SET action='TAMPERED' WHERE id=(SELECT min(id) FROM audit_logs)"),/append-only/);
  await assert.rejects(db.query('DELETE FROM audit_logs WHERE id=(SELECT min(id) FROM audit_logs)'),/append-only/);
