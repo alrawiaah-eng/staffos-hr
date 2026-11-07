@@ -1,5 +1,6 @@
 import {scryptSync,randomBytes,timingSafeEqual,createHash,createCipheriv,createDecipheriv} from 'node:crypto';
 import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import {existsSync} from 'node:fs';
 import path from 'node:path';
 export const permissionLabels={
  'employees.all':'عرض جميع الموظفين','employees.team':'عرض موظفي القسم','employees.edit':'إدارة السجل الوظيفي','salary.view':'عرض الراتب','salary.edit':'تعديل الراتب',
@@ -22,7 +23,10 @@ export const digest=value=>createHash('sha256').update(value).digest('hex');
 export async function encryptionKey(){
  if(process.env.DOCUMENT_KEY){const key=Buffer.from(process.env.DOCUMENT_KEY,'hex');if(key.length!==32)throw Error('DOCUMENT_KEY must contain 64 hexadecimal characters');return key;}
  if(process.env.NODE_ENV==='production')throw Error('DOCUMENT_KEY is required in production');
- const directory=process.env.STAFFOS_DATA_DIR||'./data';
+ // مفتاح موجود داخل المشروع يبقى مستعملًا كما هو: تغيير مكانه يجعل كل
+ // صور المستمسكات المشفّرة سابقًا غير قابلة للفتح.
+ const legacy=path.join('./data','document.key');
+ const directory=process.env.STAFFOS_DATA_DIR||(process.platform==='win32'&&!existsSync(legacy)?path.join(process.env.APPDATA||process.env.LOCALAPPDATA||process.cwd(),'StaffOS','data'):'./data');
  const keyPath=path.join(directory,'document.key');
  await mkdir(directory,{recursive:true});try{return await readFile(keyPath);}catch(e){if(e.code!=='ENOENT')throw e;const key=randomBytes(32);await writeFile(keyPath,key,{mode:0o600,flag:'wx'});return key;}
 }
